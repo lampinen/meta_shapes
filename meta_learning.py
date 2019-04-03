@@ -19,8 +19,8 @@ config = {
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
-    "num_hidden": 64,
-    "num_hidden_hyper": 512, 
+    "num_hidden": 32,
+    "num_hidden_hyper": 128, 
     "convolution_specs": [ # (kernel_size, depth, stride, pool, pool_stride)
         (5, 10, 2, 3, 3),
         (2, 32, 2, 1, 1)
@@ -29,8 +29,11 @@ config = {
 
     "init_learning_rate": 1e-4,
     "lr_decay": 0.85,
-    "lr_decays_every": 100,
-    "min_learning_rate": 3e-8,
+    "lr_decays_every": 10,
+    "min_lr": 3e-8,
+
+    "num_epochs": 200,
+    "eval_every": 1,
 
     "internal_nonlinearity": tf.nn.leaky_relu,
 
@@ -51,11 +54,11 @@ max_query_len = 0
 vocab = config["vocab"] 
 vocab_to_ints = dict(zip(vocab, range(len(vocab))))
 
-def process_query_data(query_data, max_query_len):
-    query_data = [re.sub('[()]', '', x).split() for x in query_data]
-    query_data = [["PAD"] * (max_query_len - len(x)) + x + ["EOS"] for x in query_data]
-    query_data = [[vocab_to_ints[w] for w in x] for x in query_data]
-    return np.array(query_data, dtype=np.int32)
+def process_query(query, max_query_len):
+    query = re.sub('[()]', '', query).split()
+    query = ["PAD"] * (max_query_len - len(query)) + query + ["EOS"]
+    query = [vocab_to_ints[w] for w in query]
+    return np.array([query], dtype=np.int32)
     
 
 for dataset in ["train.large", "val", "test"]:
@@ -66,7 +69,21 @@ for dataset in ["train.large", "val", "test"]:
     max_query_len = max(max_query_len, max([len(x.split()) for x in data[dataset]["query_raw"]]))
 
 for dataset in ["train.large", "val", "test"]:
-    data[dataset]["query"] = process_query_data(data[dataset]["query_raw"], max_query_len) 
+    raw_queries = data[dataset]["query_raw"]
+    raw_query_list = list(set(raw_queries))
+    this_input = []
+    this_output = []
+    this_query = []
+    for query in raw_query_list:
+        index_vec = raw_queries == query
+        this_query.append(process_query(query, max_query_len)) 
+        this_input.append(data[dataset]["input"][index_vec])
+        this_output.append(data[dataset]["output"][index_vec])
+
+    data[dataset]["input"] = this_input
+    data[dataset]["output"] = this_output 
+    data[dataset]["query_raw"] = raw_query_list 
+    data[dataset]["query"] = this_query 
 
 config["max_seq_len"] = max_query_len + 1 # + 1 for EOS
 
@@ -74,7 +91,9 @@ config["max_seq_len"] = max_query_len + 1 # + 1 for EOS
 ### model 
 
 class shape_model(object):
-    def __init__(self, config):
+    def __init__(self, config, data):
+        self.config = config
+        self.data = data
         num_hidden = config["num_hidden"]
         num_hidden_hyper = config["num_hidden_hyper"]
         num_task_hidden_layers = config["num_task_hidden_layers"]
@@ -240,4 +259,90 @@ class shape_model(object):
         self.sess = tf.Session(config=sess_config)
         self.sess.run(tf.global_variables_initializer())
 
-shape_model(config)
+
+    def evaluate(self, dataset):
+        inputs = dataset["input"]
+        targets = dataset["output"]
+        queries = dataset["query"]
+        loss = 0.
+        pct_correct = 0.
+        for i, query in enumerate(queries):
+            this_q_inputs = inputs[i]
+            this_q_targets = targets[i]
+
+            feed_dict = {
+                self.query_ph: query,
+                self.visual_input_ph: this_q_inputs,
+                self.target_ph: this_q_targets
+            }
+
+            this_loss, this_pctc =  self.sess.run([self.total_loss, 
+                                                   self.pct_correct], 
+                                                  feed_dict=feed_dict)
+
+            loss += this_loss
+            pct_correct += this_pctc
+
+        loss /= i + 1
+        pct_correct /= i + 1
+        return loss, pct_correct
+
+
+    def all_eval(self):
+        names = []
+        results = []
+        for name, dataset in self.data.items():
+            this_results = self.evaluate(dataset)
+            results += this_results 
+            names += [name + "_loss", name + "_pct_correct"]
+
+        return names, results
+
+
+    def train_step(self, dataset, lr):
+        inputs = dataset["input"]
+        targets = dataset["output"]
+        queries = dataset["query"]
+        for i, query in enumerate(queries):
+            this_q_inputs = inputs[i]
+            this_q_targets = targets[i]
+
+            feed_dict = {
+                self.lr_ph: lr,
+                self.query_ph: query,
+                self.visual_input_ph: this_q_inputs,
+                self.target_ph: this_q_targets
+            }
+
+            self.sess.run(self.train, 
+                          feed_dict=feed_dict)
+
+
+    def do_training(self, filename):
+        with open(filename, "w") as fout:
+            names, losses = self.all_eval()
+            print(names)
+            fout.write(", ".join(["epoch"] + names) + "\n")
+            loss_format = ", ".join(["%i"] + ["%f"] * len(losses))
+            fout.write(loss_format % tuple([0] + losses))
+            lr = self.config["init_learning_rate"] 
+            eval_every = self.config["eval_every"]
+            lr_decay = self.config["lr_decay"]
+            decay_every = self.config["lr_decays_every"]
+            min_lr = self.config["min_lr"]
+            for epoch in range(1, self.config["num_epochs"] + 1): 
+                self.train_step(self.data["train.large"], lr)
+
+                if epoch % eval_every == 0: 
+                    _, losses = self.all_eval()
+                    fout.write(loss_format % tuple([epoch] + losses))
+                    print(loss_format % tuple([epoch] + losses))
+
+                if epoch % decay_every == 0 and lr > min_lr:
+                    lr *= lr_decay
+
+
+for run_i in range(config["run_offset"], config["run_offset"] + config["num_runs"]):
+    model = shape_model(config, data)
+    model.do_training("results/run%i_model%s_losses.csv" % (run_i, config["architecture"]))
+
