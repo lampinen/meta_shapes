@@ -33,9 +33,9 @@ config = {
     "lr_decays_every": 50,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 1., # dropout on language network
-    "train_batch_subset": 64, # how much of train batch to take at a time -- further stochasticity
-    "l2_penalty_weight": 1e-4,
+    "train_keep_prob": 0.5, # dropout on language network
+    "train_batch_subset": 32, # how much of train batch to take at a time -- further stochasticity
+    "l2_penalty_weight": 5e-4,
 
     "num_epochs": 10000,
     "eval_every": 10,
@@ -49,6 +49,11 @@ config = {
     "results_path": "/mnt/fs2/lampinen/meta_shapes/results/"
 }
 
+def _save_config(filename, config):
+    with open(filename, "w") as fout:
+        fout.write("key, value\n")
+        for key, value in config.items():
+            fout.write(key + ", " + str(value) + "\n")
 
 # from GloVe 6B 50d
 initial_embeddings = np.array([
@@ -386,6 +391,7 @@ class shape_model(object):
                     lr *= lr_decay
 
 
+_save_config(config["results_path"] + "config.csv", config)
 for run_i in range(config["run_offset"], config["run_offset"] + config["num_runs"]):
     np.random.seed(run_i)
     tf.set_random_seed(run_i)
