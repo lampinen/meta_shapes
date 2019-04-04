@@ -19,7 +19,7 @@ config = {
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
-    "num_hidden": 64,
+    "num_hidden": 32,
     "num_hidden_hyper": 256, 
     "convolution_specs": [ # (kernel_size, depth, stride, pool, pool_stride)
         (6, 10, 2, 1, 1),
@@ -33,11 +33,16 @@ config = {
     "lr_decays_every": 50,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 0.5, # dropout on language network
-    "train_batch_subset": 32, # how much of train batch to take at a time -- further stochasticity
-    "l2_penalty_weight": 5e-4,
+    "train_keep_prob": 1., # dropout on language network
+#    "train_batch_subset": 64, # DEACTIVATED -- how much of train batch to take at a time -- further stochasticity
+    "l2_penalty_weight": 1e-4,
 
-    "num_epochs": 10000,
+    "train_with_meta": True, # if meta, whether to also train with meta->hyper
+    "meta_batch_size": 32,
+    "meta_embedding_scale": 1e-3, # try to match initial scale of embeddings 
+                                  # from language and meta
+
+    "num_epochs": 5000,
     "eval_every": 10,
 
     "internal_nonlinearity": tf.nn.leaky_relu,
@@ -46,7 +51,7 @@ config = {
 
     "image_size": 30,
     "data_path": "shapes_data/",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results/"
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results_with_meta/"
 }
 
 def _save_config(filename, config):
@@ -121,7 +126,8 @@ class shape_model(object):
     def __init__(self, config, data):
         self.config = config
         self.data = data
-        self.train_batch_subset = config["train_batch_subset"]
+        #self.train_batch_subset = config["train_batch_subset"]
+        self.train_with_meta = config["train_with_meta"]
         num_hidden = config["num_hidden"]
         num_hidden_hyper = config["num_hidden_hyper"]
         num_task_hidden_layers = config["num_task_hidden_layers"]
@@ -189,8 +195,47 @@ class shape_model(object):
                                                         activation_fn=None)
 #            print(self.processed_input.get_shape())
 
-        if architecture_is_meta:
 
+        # target processing 
+
+        self.processed_labels = tf.one_hot(self.target_ph, depth=2)
+        self.target_processor = tf.get_variable("target_processor", shape=[2, num_hidden_hyper])
+        embedded_targets = tf.matmul(self.processed_labels, self.target_processor)
+
+        if architecture_is_meta:
+            if self.train_with_meta:
+                self.guess_input_mask_ph = tf.placeholder(tf.bool, shape=[None]) # which datapoints get excluded from the guess
+
+                def _meta_network(embedded_inputs, embedded_targets,
+                                   mask_ph=self.guess_input_mask_ph, reuse=True):
+                    with tf.variable_scope('meta', reuse=reuse):
+                        guess_input = tf.concat([embedded_inputs,
+                                                 embedded_targets], axis=-1)
+                        guess_input = tf.boolean_mask(guess_input,
+                                                      self.guess_input_mask_ph)
+                        guess_input = tf.nn.dropout(guess_input, self.keep_ph)
+
+                        gh_1 = slim.fully_connected(guess_input, num_hidden_hyper,
+                                                    activation_fn=internal_nonlinearity)
+                        gh_1 = tf.nn.dropout(gh_1, self.keep_ph)
+                        gh_2 = slim.fully_connected(gh_1, num_hidden_hyper,
+                                                    activation_fn=internal_nonlinearity)
+                        gh_2 = tf.nn.dropout(gh_2, self.keep_ph)
+                        gh_2b = tf.reduce_max(gh_2, axis=0, keep_dims=True)
+                        gh_3 = slim.fully_connected(gh_2b, num_hidden_hyper,
+                                                    activation_fn=internal_nonlinearity)
+                        gh_3 = tf.nn.dropout(gh_3, self.keep_ph)
+
+                        guess_embedding = slim.fully_connected(gh_3, num_hidden_hyper,
+                                                               activation_fn=None)
+                        guess_embedding = tf.nn.dropout(guess_embedding, self.keep_ph)
+                        return guess_embedding
+
+                self.guess_function_emb = _meta_network(self.processed_input,
+                                                        embedded_targets,
+                                                        reuse=False)
+                self.guess_function_emb *= config["meta_embedding_scale"]
+                
             tw_range = config["task_weight_weight_mult"]/np.sqrt(
                 num_hidden * num_hidden_hyper) # yields a very very roughly O(1) map
             task_weight_gen_init = tf.random_uniform_initializer(-tw_range,
@@ -240,6 +285,8 @@ class shape_model(object):
                     return hidden_weights, hidden_biases
 
             self.task_params = _hyper_network(self.query_embedding, reuse=False)
+            if self.train_with_meta:
+                self.meta_task_params = _hyper_network(self.guess_function_emb, reuse=True)
 
             # task network
             def _task_network(task_params, processed_input):
@@ -254,35 +301,53 @@ class shape_model(object):
                 return raw_output
 
 
-            self.base_raw_output = _task_network(self.task_params,
+            self.lang_raw_output = _task_network(self.task_params,
                                                  self.processed_input)
+            if self.train_with_meta:
+                self.meta_raw_output = _task_network(self.meta_task_params,
+                                                     self.processed_input)
 
         else:
             raise NotImplementedError("Not yet implemented!")
 
+        def _output_network(raw_output, reuse=True):
+            with tf.variable_scope('output', reuse=reuse):
+                output_logits = slim.fully_connected(raw_output,
+                                                     2,
+                                                     activation_fn=None)
+                return output_logits
 
-        with tf.variable_scope('output'):
-            self.base_output_logits = slim.fully_connected(self.base_raw_output,
-                                                           2,
-                                                           activation_fn=None)
+        self.lang_output_logits = _output_network(self.lang_raw_output, 
+                                                  reuse=False)
+        self.lang_output = tf.nn.softmax(self.lang_output_logits)
 
-        self.base_output = tf.nn.softmax(self.base_output_logits)
-
-        self.processed_labels = tf.one_hot(self.target_ph, depth=2)
-
-        self.item_losses = tf.nn.softmax_cross_entropy_with_logits(
-            logits=self.base_output_logits,
+        self.lang_item_losses = tf.nn.softmax_cross_entropy_with_logits(
+            logits=self.lang_output_logits,
             labels=self.processed_labels)
 
-        self.total_loss = tf.reduce_mean(self.item_losses)
+        self.lang_total_loss = tf.reduce_mean(self.lang_item_losses)
+
+        if architecture_is_meta and self.train_with_meta:
+            self.meta_output_logits = _output_network(self.meta_raw_output, 
+                                                      reuse=True)
+            self.meta_output = tf.nn.softmax(self.meta_output_logits)
+            self.meta_item_losses = tf.nn.softmax_cross_entropy_with_logits(
+                logits=self.meta_output_logits,
+                labels=self.processed_labels)
+
+            self.meta_total_loss = tf.reduce_mean(self.meta_item_losses)
 
         # l2 reg
         weight_vars = [v for v in tf.trainable_variables() if 'bias' not in v.name and 'embeddings' not in v.name]
         self.l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in weight_vars]) * config["l2_penalty_weight"]
-        self.train_loss = self.total_loss + self.l2_loss 
 
-        corr_scores = tf.reduce_sum(tf.multiply(self.base_output_logits, self.processed_labels), axis=-1) 
-        incorr_scores = tf.reduce_sum(tf.multiply(self.base_output_logits, 1.-self.processed_labels), axis=-1) 
+        self.train_loss = self.lang_total_loss + self.l2_loss 
+        if architecture_is_meta and self.train_with_meta:
+            self.train_loss += self.meta_total_loss
+
+
+        corr_scores = tf.reduce_sum(tf.multiply(self.lang_output_logits, self.processed_labels), axis=-1) 
+        incorr_scores = tf.reduce_sum(tf.multiply(self.lang_output_logits, 1.-self.processed_labels), axis=-1) 
         self.item_scores = tf.cast(tf.greater(corr_scores, incorr_scores), tf.float32)
         self.pct_correct = tf.reduce_mean(self.item_scores)
 
@@ -301,12 +366,30 @@ class shape_model(object):
         self.sess.run(tf.global_variables_initializer())
 
 
+    def _random_guess_mask(self, dataset_length, meta_batch_size=None):
+        if meta_batch_size is None:
+            meta_batch_size = config["meta_batch_size"]
+        mask = np.zeros(dataset_length, dtype=np.bool)
+        indices = np.random.permutation(dataset_length)[:meta_batch_size]
+        mask[indices] = True
+        return mask
+
+
     def evaluate(self, dataset):
         inputs = dataset["input"]
         targets = dataset["output"]
         queries = dataset["query"]
         loss = 0.
+        meta_loss = 0.
         pct_correct = 0.
+        if self.train_with_meta:
+            fetches = [self.lang_total_loss, 
+                       self.pct_correct,
+                       self.meta_total_loss]
+        else:
+            fetches = [self.lang_total_loss, 
+                       self.pct_correct]
+
         for i, query in enumerate(queries):
             this_q_inputs = inputs[i]
             this_q_targets = targets[i]
@@ -317,17 +400,27 @@ class shape_model(object):
                 self.visual_input_ph: this_q_inputs,
                 self.target_ph: this_q_targets
             }
+            if self.train_with_meta:
+                feed_dict[self.guess_input_mask_ph] =  np.ones([len(this_q_targets)])
 
-            this_loss, this_pctc =  self.sess.run([self.total_loss, 
-                                                   self.pct_correct], 
-                                                  feed_dict=feed_dict)
+            results =  self.sess.run(fetches, 
+                                     feed_dict=feed_dict)
 
+            if self.train_with_meta:
+                this_loss, this_pctc, this_meta_loss = results
+                meta_loss += this_meta_loss
+            else:
+                this_loss, this_pctc = results
             loss += this_loss
             pct_correct += this_pctc
 
         loss /= i + 1
         pct_correct /= i + 1
-        return loss, pct_correct
+        if self.train_with_meta:
+            meta_loss /= i + 1
+            return loss, pct_correct, meta_loss
+        else:
+            return loss, pct_correct
 
 
     def all_eval(self):
@@ -336,7 +429,10 @@ class shape_model(object):
         for name, dataset in self.data.items():
             this_results = self.evaluate(dataset)
             results += this_results 
-            names += [name + "_loss", name + "_pct_correct"]
+            if self.train_with_meta:
+                names += [name + "_loss", name + "_pct_correct", name + "_meta_loss"]
+            else:
+                names += [name + "_loss", name + "_pct_correct"]
 
         return names, results
 
@@ -350,9 +446,9 @@ class shape_model(object):
             query = queries[i]
             this_q_inputs = inputs[i]
             this_q_targets = targets[i]
-            subset = np.random.permutation(len(this_q_targets))[:self.train_batch_subset]
-            this_q_inputs = this_q_inputs[subset]
-            this_q_targets = this_q_targets[subset]
+#            subset = np.random.permutation(len(this_q_targets))[:self.train_batch_subset]
+#            this_q_inputs = this_q_inputs[subset]
+#            this_q_targets = this_q_targets[subset]
 
             feed_dict = {
                 self.lr_ph: lr,
@@ -361,6 +457,8 @@ class shape_model(object):
                 self.visual_input_ph: this_q_inputs,
                 self.target_ph: this_q_targets
             }
+            if self.train_with_meta:
+                feed_dict[self.guess_input_mask_ph] =  self._random_guess_mask(len(this_q_targets))
 
             self.sess.run(self.train, 
                           feed_dict=feed_dict)
@@ -396,6 +494,6 @@ for run_i in range(config["run_offset"], config["run_offset"] + config["num_runs
     np.random.seed(run_i)
     tf.set_random_seed(run_i)
     model = shape_model(config, data)
-    model.do_training("results/run%i_model%s_losses.csv" % (run_i, config["architecture"]))
+    model.do_training(config["results_path"] + "run%i_model%s_losses.csv" % (run_i, config["architecture"]))
     tf.reset_default_graph()
 
