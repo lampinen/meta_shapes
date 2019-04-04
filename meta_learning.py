@@ -33,8 +33,9 @@ config = {
     "lr_decays_every": 50,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 0.5, # dropout on language network
-    "train_batch_subset": 32, # how much of train batch to take at a time -- further stochasticity
+    "train_keep_prob": 1., # dropout on language network
+    "train_batch_subset": 64, # how much of train batch to take at a time -- further stochasticity
+    "l2_penalty_weight": 1e-4,
 
     "num_epochs": 10000,
     "eval_every": 10,
@@ -270,6 +271,11 @@ class shape_model(object):
 
         self.total_loss = tf.reduce_mean(self.item_losses)
 
+        # l2 reg
+        weight_vars = [v for v in tf.trainable_variables() if 'bias' not in v.name and 'embeddings' not in v.name]
+        self.l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in weight_vars]) * config["l2_penalty_weight"]
+        self.train_loss = self.total_loss + self.l2_loss 
+
         corr_scores = tf.reduce_sum(tf.multiply(self.base_output_logits, self.processed_labels), axis=-1) 
         incorr_scores = tf.reduce_sum(tf.multiply(self.base_output_logits, 1.-self.processed_labels), axis=-1) 
         self.item_scores = tf.cast(tf.greater(corr_scores, incorr_scores), tf.float32)
@@ -278,7 +284,7 @@ class shape_model(object):
         self.lr_ph = tf.placeholder(tf.float32)
         optimizer = tf.train.RMSPropOptimizer(self.lr_ph)
 
-        self.train = optimizer.minimize(self.total_loss)
+        self.train = optimizer.minimize(self.train_loss)
 
         # Saver
         self.saver = tf.train.Saver()
