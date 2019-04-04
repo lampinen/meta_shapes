@@ -19,21 +19,25 @@ config = {
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
-    "num_hidden": 32,
-    "num_hidden_hyper": 128, 
+    "num_hidden": 64,
+    "num_hidden_hyper": 256, 
     "convolution_specs": [ # (kernel_size, depth, stride, pool, pool_stride)
-        (5, 10, 2, 3, 3),
+        (6, 10, 2, 1, 1),
+        (3, 32, 1, 3, 3),
         (2, 32, 2, 1, 1)
     ], 
     "task_weight_weight_mult": 1., 
 
     "init_learning_rate": 1e-4,
     "lr_decay": 0.85,
-    "lr_decays_every": 20,
-    "min_lr": 3e-8,
+    "lr_decays_every": 50,
+    "min_lr": 1e-6,
 
-    "num_epochs": 200,
-    "eval_every": 3,
+    "train_keep_prob": 0.5, # dropout on language network
+    "train_batch_subset": 32, # how much of train batch to take at a time -- further stochasticity
+
+    "num_epochs": 10000,
+    "eval_every": 10,
 
     "internal_nonlinearity": tf.nn.leaky_relu,
 
@@ -111,6 +115,7 @@ class shape_model(object):
     def __init__(self, config, data):
         self.config = config
         self.data = data
+        self.train_batch_subset = config["train_batch_subset"]
         num_hidden = config["num_hidden"]
         num_hidden_hyper = config["num_hidden_hyper"]
         num_task_hidden_layers = config["num_task_hidden_layers"]
@@ -128,6 +133,8 @@ class shape_model(object):
             tf.int32, shape=[1, max_seq_len])
         self.target_ph = tf.placeholder(tf.int32, shape=[None,])
 
+        self.keep_ph = tf.placeholder(tf.float32)
+
         # query processing
         with tf.variable_scope('query') as scope:
             self.word_embeddings = tf.get_variable(
@@ -139,6 +146,7 @@ class shape_model(object):
                 cells = [tf.nn.rnn_cell.LSTMCell(
                     num_hidden_hyper,
                     activation=internal_nonlinearity) for _ in range(num_language_layers)]
+                cells = [tf.nn.rnn_cell.DropoutWrapper(cell, output_keep_prob=self.keep_ph) for cell in cells]
 
                 stacked_lstm = tf.nn.rnn_cell.MultiRNNCell(cells)
 
@@ -149,6 +157,7 @@ class shape_model(object):
 
             self.query_embedding = slim.fully_connected(this_output, num_hidden_hyper,
                                                         activation_fn=None)
+            self.query_embedding = slim.dropout(self.query_embedding, keep_prob=self.keep_ph)
 
         # input processing
         with tf.variable_scope('vision'):
@@ -158,11 +167,14 @@ class shape_model(object):
                 vision_hidden = slim.convolution2d(
                     vision_hidden, depth, kernel_size, stride, 
                     activation_fn=internal_nonlinearity, padding="SAME")
+                vision_hidden = tf.nn.dropout(
+                    vision_hidden, keep_prob=self.keep_ph,
+                    noise_shape=tf.constant([1, 1, vision_hidden.get_shape()[3]],
+                                            dtype=tf.int32))
 #                print(vision_hidden.get_shape())
                 if pool > 1:
                     vision_hidden = slim.max_pool2d(vision_hidden, pool, pool_stride)
 #                    print(vision_hidden.get_shape())
-
 
             vision_hidden = slim.flatten(vision_hidden)
             vision_hidden = slim.fully_connected(vision_hidden, num_hidden_hyper,
@@ -184,7 +196,7 @@ class shape_model(object):
                     for _ in range(config["num_hyper_hidden_layers"]):
                         hyper_hidden = slim.fully_connected(hyper_hidden, num_hidden_hyper,
                                                             activation_fn=internal_nonlinearity)
-#                        hyper_hidden = tf.nn.dropout(hyper_hidden, self.keep_prob_ph)
+                        hyper_hidden = tf.nn.dropout(hyper_hidden, self.keep_ph)
 
                     hidden_weights = []
                     hidden_biases = []
@@ -192,11 +204,12 @@ class shape_model(object):
                     task_weights = slim.fully_connected(hyper_hidden, num_hidden*(num_hidden_hyper +(num_task_hidden_layers-1)*num_hidden + num_hidden_hyper),
                                                         activation_fn=None,
                                                         weights_initializer=task_weight_gen_init)
-#                    task_weights = tf.nn.dropout(task_weights, self.keep_prob_ph)
 
                     task_weights = tf.reshape(task_weights, [-1, num_hidden, (num_hidden_hyper + (num_task_hidden_layers-1)*num_hidden + num_hidden_hyper)])
                     task_biases = slim.fully_connected(hyper_hidden, num_task_hidden_layers * num_hidden + num_hidden_hyper,
                                                        activation_fn=None)
+
+                    task_biases = tf.nn.dropout(task_biases, self.keep_ph)
 
                     Wi = tf.transpose(task_weights[:, :, :num_hidden_hyper], perm=[0, 2, 1])
                     bi = task_biases[:, :num_hidden]
@@ -211,8 +224,8 @@ class shape_model(object):
                     bfinal = task_biases[:, -num_hidden_hyper:]
 
                     for i in range(num_task_hidden_layers):
-                        hidden_weights[i] = tf.squeeze(hidden_weights[i], axis=0)
-                        hidden_biases[i] = tf.squeeze(hidden_biases[i], axis=0)
+                        hidden_weights[i] = tf.squeeze(tf.nn.dropout(hidden_weights[i], self.keep_ph), axis=0)
+                        hidden_biases[i] = tf.squeeze(tf.nn.dropout(hidden_biases[i], self.keep_ph), axis=0)
 
                     Wfinal = tf.squeeze(Wfinal, axis=0)
                     bfinal = tf.squeeze(bfinal, axis=0)
@@ -288,6 +301,7 @@ class shape_model(object):
             this_q_targets = targets[i]
 
             feed_dict = {
+                self.keep_ph: 1.,
                 self.query_ph: query,
                 self.visual_input_ph: this_q_inputs,
                 self.target_ph: this_q_targets
@@ -320,12 +334,18 @@ class shape_model(object):
         inputs = dataset["input"]
         targets = dataset["output"]
         queries = dataset["query"]
-        for i, query in enumerate(queries):
+        order = np.random.permutation(len(queries))
+        for i in order:
+            query = queries[i]
             this_q_inputs = inputs[i]
             this_q_targets = targets[i]
+            subset = np.random.permutation(len(this_q_targets))[:self.train_batch_subset]
+            this_q_inputs = this_q_inputs[subset]
+            this_q_targets = this_q_targets[subset]
 
             feed_dict = {
                 self.lr_ph: lr,
+                self.keep_ph: config["train_keep_prob"],
                 self.query_ph: query,
                 self.visual_input_ph: this_q_inputs,
                 self.target_ph: this_q_targets
