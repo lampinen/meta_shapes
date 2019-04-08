@@ -14,7 +14,7 @@ config = {
     "run_offset": 0,
     "num_runs": 5,
 
-    "architecture": "conditioned", # meta or conditioned
+    "architecture": "meta", # meta or conditioned
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
@@ -51,8 +51,9 @@ config = {
     "image_size": 30,
     "data_path": "/mnt/fs2/lampinen/datasets/shapes_data/",
     "generate_vgg_features_and_exit": False, # generate and save vgg features for dataset, exit
+    "load_vgg_features": True, # load vgg features instead of raw images
     "vgg_restore_path": "/mnt/fs2/lampinen/checkpoints/vgg_16/vgg_16.ckpt",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results_conditioned/"
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results/"
 }
 
 def _save_config(filename, config):
@@ -96,7 +97,10 @@ def process_query(query, max_query_len):
 
 for dataset in ["train.large", "val", "test"]:
     data[dataset] = {}
-    data[dataset]["input"] = np.load(data_path + dataset + ".input.npy")
+    if config["load_vgg_features"]:
+        data[dataset]["input"] = np.load(data_path + dataset + ".input.features.npy")
+    else:
+        data[dataset]["input"] = np.load(data_path + dataset + ".input.npy")
     data[dataset]["output"] = 1*(np.loadtxt(data_path + dataset + ".output", dtype=np.str) == 'true')
     data[dataset]["query_raw"] = np.loadtxt(data_path + dataset + ".query", dtype=np.str, delimiter=",")
     max_query_len = max(max_query_len, max([len(x.split()) for x in data[dataset]["query_raw"]]))
@@ -137,11 +141,16 @@ class shape_model(object):
         internal_nonlinearity = config["internal_nonlinearity"]
         image_size = config["image_size"]
         max_seq_len = config["max_seq_len"]
+        load_vgg_features = config["load_vgg_features"]
         architecture_is_meta = config["architecture"] == "meta"
         vocab_size = len(config["vocab"])
 
-        self.visual_input_ph = tf.placeholder(
-            tf.float32, shape=[None, image_size, image_size, 3]) 
+        if load_vgg_features:
+            self.visual_input_ph = tf.placeholder(
+                tf.float32, shape=[None, 4096]) 
+        else:
+            self.visual_input_ph = tf.placeholder(
+                tf.float32, shape=[None, image_size, image_size, 3]) 
         self.query_ph = tf.placeholder(
             tf.int32, shape=[1, max_seq_len])
         self.target_ph = tf.placeholder(tf.int32, shape=[None,])
@@ -175,19 +184,22 @@ class shape_model(object):
         # input processing
 
         with tf.variable_scope('vision'):
-            vgg = snets.vgg
-            with slim.arg_scope(vgg.vgg_arg_scope(weight_decay=0.)):
-                vision_inputs = tf.image.resize_images(self.visual_input_ph, [224, 224]) 
-                _, end_points = vgg.vgg_16(vision_inputs, 
-                                           is_training=False,
-                                           dropout_keep_prob=self.keep_ph)
-                vision_hidden = end_points['vision/vgg_16/fc7']
+            if load_vgg_features:
+                self.vision_hidden = self.visual_input_ph
+            else:
+                vgg = snets.vgg
+                with slim.arg_scope(vgg.vgg_arg_scope(weight_decay=0.)):
+                    vision_inputs = tf.image.resize_images(self.visual_input_ph, [224, 224]) 
+                    _, end_points = vgg.vgg_16(vision_inputs, 
+                                               is_training=False,
+                                               dropout_keep_prob=self.keep_ph)
+                    vision_hidden = end_points['vision/vgg_16/fc7']
 
 
-            variables_to_restore = tf.contrib.framework.get_variables_to_restore(include=['vision/vgg_16/'])
-            init_fn = tf.contrib.framework.assign_from_checkpoint_fn(config["vgg_restore_path"], variables_to_restore)
+                variables_to_restore = tf.contrib.framework.get_variables_to_restore(include=['vision/vgg_16/'])
+                init_fn = tf.contrib.framework.assign_from_checkpoint_fn(config["vgg_restore_path"], variables_to_restore)
 
-            self.vision_hidden = slim.flatten(vision_hidden)
+                self.vision_hidden = slim.flatten(vision_hidden)
             
             self.processed_input = slim.fully_connected(self.vision_hidden, 
                                                         num_hidden_hyper,
