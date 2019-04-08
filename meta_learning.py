@@ -5,17 +5,16 @@ from __future__ import division
 import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
+import tensorflow.contrib.slim.nets as snets
 import re 
 import os
-
-
 
 ##
 config = {
     "run_offset": 0,
     "num_runs": 5,
 
-    "architecture": "meta", # meta or conditioned
+    "architecture": "conditioned", # meta or conditioned
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
@@ -28,16 +27,16 @@ config = {
     ], 
     "task_weight_weight_mult": 1., 
 
-    "init_learning_rate": 1e-4,
+    "init_learning_rate": 1e-3,
     "lr_decay": 0.85,
     "lr_decays_every": 50,
     "min_lr": 1e-6,
 
     "train_keep_prob": 1., # dropout on language network
 #    "train_batch_subset": 64, # DEACTIVATED -- how much of train batch to take at a time -- further stochasticity
-    "l2_penalty_weight": 1e-4,
+    "l2_penalty_weight": 0.,
 
-    "train_with_meta": True, # if meta, whether to also train with meta->hyper
+    "train_with_meta": False, # if meta, whether to also train with meta->hyper
     "meta_batch_size": 32,
     "meta_embedding_scale": 1e-3, # try to match initial scale of embeddings 
                                   # from language and meta
@@ -50,8 +49,10 @@ config = {
     "vocab": ["PAD", "EOS", "is", "triangle", "circle", "square", "above", "below", "right_of", "left_of", "red", "green", "blue"],
 
     "image_size": 30,
-    "data_path": "shapes_data/",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results_with_meta/"
+    "data_path": "/mnt/fs2/lampinen/datasets/shapes_data/",
+    "generate_vgg_features_and_exit": False, # generate and save vgg features for dataset, exit
+    "vgg_restore_path": "/mnt/fs2/lampinen/checkpoints/vgg_16/vgg_16.ckpt",
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results_conditioned/"
 }
 
 def _save_config(filename, config):
@@ -172,28 +173,25 @@ class shape_model(object):
             self.query_embedding = slim.dropout(self.query_embedding, keep_prob=self.keep_ph)
 
         # input processing
-        with tf.variable_scope('vision'):
-            vision_hidden = self.visual_input_ph 
-#            print(vision_hidden.get_shape())
-            for kernel_size, depth, stride, pool, pool_stride in config["convolution_specs"]:
-                vision_hidden = slim.convolution2d(
-                    vision_hidden, depth, kernel_size, stride, 
-                    activation_fn=internal_nonlinearity, padding="SAME")
-                vision_hidden = tf.nn.dropout(
-                    vision_hidden, keep_prob=self.keep_ph,
-                    noise_shape=tf.constant([1, 1, vision_hidden.get_shape()[3]],
-                                            dtype=tf.int32))
-#                print(vision_hidden.get_shape())
-                if pool > 1:
-                    vision_hidden = slim.max_pool2d(vision_hidden, pool, pool_stride)
-#                    print(vision_hidden.get_shape())
 
-            vision_hidden = slim.flatten(vision_hidden)
-            vision_hidden = slim.fully_connected(vision_hidden, num_hidden_hyper,
-                                                 activation_fn=internal_nonlinearity)
-            self.processed_input = slim.fully_connected(vision_hidden, num_hidden_hyper,
+        with tf.variable_scope('vision'):
+            vgg = snets.vgg
+            with slim.arg_scope(vgg.vgg_arg_scope(weight_decay=0.)):
+                vision_inputs = tf.image.resize_images(self.visual_input_ph, [224, 224]) 
+                _, end_points = vgg.vgg_16(vision_inputs, 
+                                           is_training=False,
+                                           dropout_keep_prob=self.keep_ph)
+                vision_hidden = end_points['vision/vgg_16/fc7']
+
+
+            variables_to_restore = tf.contrib.framework.get_variables_to_restore(include=['vision/vgg_16/'])
+            init_fn = tf.contrib.framework.assign_from_checkpoint_fn(config["vgg_restore_path"], variables_to_restore)
+
+            self.vision_hidden = slim.flatten(vision_hidden)
+            
+            self.processed_input = slim.fully_connected(self.vision_hidden, 
+                                                        num_hidden_hyper,
                                                         activation_fn=None)
-#            print(self.processed_input.get_shape())
 
 
         # target processing 
@@ -307,8 +305,28 @@ class shape_model(object):
                 self.meta_raw_output = _task_network(self.meta_task_params,
                                                      self.processed_input)
 
-        else:
-            raise NotImplementedError("Not yet implemented!")
+        else: # Conditioned on language
+
+            def _conditioned_inference(query_embedding, processed_input, 
+                                       reuse=True):
+                with tf.variable_scope('inference', reuse=reuse):
+                    query_embedding = tf.tile(query_embedding, [tf.shape(processed_input)[0], 1])
+                    concat_input = tf.concat([query_embedding,
+                                              processed_input], axis=-1)
+                    ch = tf.nn.dropout(concat_input, self.keep_ph)
+                
+                    for i in range(num_task_hidden_layers):
+                        ch = slim.fully_connected(
+                            ch, num_hidden_hyper,
+                            activation_fn=internal_nonlinearity)
+
+                        ch = tf.nn.dropout(ch, self.keep_ph)
+
+                return ch
+
+            self.lang_raw_output = _conditioned_inference(self.query_embedding,
+                                                          self.processed_input,
+                                                          reuse=False)
 
         def _output_network(raw_output, reuse=True):
             with tf.variable_scope('output', reuse=reuse):
@@ -364,6 +382,31 @@ class shape_model(object):
         sess_config.gpu_options.allow_growth = True
         self.sess = tf.Session(config=sess_config)
         self.sess.run(tf.global_variables_initializer())
+
+        if config["generate_vgg_features_and_exit"]:
+            self.generate_vgg_features()
+            exit()
+
+
+    def generate_vgg_features(self):
+        for name, dataset in self.data.items():
+            print("Saving features from %s" % name)
+            inputs = dataset["input"]
+            queries = dataset["query"]
+            features = []
+            for i in range(len(queries)):
+                this_q_inputs = inputs[i]
+
+                feed_dict = {
+                    self.keep_ph: 1.,
+                    self.visual_input_ph: this_q_inputs
+                }
+
+                res = self.sess.run(self.vision_hidden, feed_dict=feed_dict)
+                features.append(res)
+
+            features = np.concatenate(features, axis=0)
+            np.save(data_path + name + ".input.features.npy", features)
 
 
     def _random_guess_mask(self, dataset_length, meta_batch_size=None):
