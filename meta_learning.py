@@ -18,30 +18,27 @@ config = {
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
-    "num_hidden": 32,
+    "num_hidden": 16,
     "num_hidden_hyper": 256, 
-    "convolution_specs": [ # (kernel_size, depth, stride, pool, pool_stride)
-        (6, 10, 2, 1, 1),
-        (3, 32, 1, 3, 3),
-        (2, 32, 2, 1, 1)
-    ], 
     "task_weight_weight_mult": 1., 
+    "task_is_resnet": True, # make task network a resnet
+    "normalize_function_embeddings": True, # z-score function embeddings
 
-    "init_learning_rate": 1e-3,
+    "init_learning_rate": 3e-4,
     "lr_decay": 0.85,
-    "lr_decays_every": 50,
+    "lr_decays_every": 100,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 1., # dropout on language network
+    "train_keep_prob": 0.7, # dropout on language network
 #    "train_batch_subset": 64, # DEACTIVATED -- how much of train batch to take at a time -- further stochasticity
     "l2_penalty_weight": 0.,
 
-    "train_with_meta": False, # if meta, whether to also train with meta->hyper
+    "train_with_meta": True, # if meta, whether to also train with meta->hyper
     "meta_batch_size": 32,
     "meta_embedding_scale": 1e-3, # try to match initial scale of embeddings 
                                   # from language and meta
 
-    "num_epochs": 5000,
+    "num_epochs": 20000,
     "eval_every": 10,
 
     "internal_nonlinearity": tf.nn.leaky_relu,
@@ -53,7 +50,7 @@ config = {
     "generate_vgg_features_and_exit": False, # generate and save vgg features for dataset, exit
     "load_vgg_features": True, # load vgg features instead of raw images
     "vgg_restore_path": "/mnt/fs2/lampinen/checkpoints/vgg_16/vgg_16.ckpt",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results/"
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results6/"
 }
 
 def _save_config(filename, config):
@@ -200,6 +197,8 @@ class shape_model(object):
                 init_fn = tf.contrib.framework.assign_from_checkpoint_fn(config["vgg_restore_path"], variables_to_restore)
 
                 self.vision_hidden = slim.flatten(vision_hidden)
+
+            self.vision_hidden = tf.nn.dropout(self.vision_hidden, self.keep_ph)
             
             self.processed_input = slim.fully_connected(self.vision_hidden, 
                                                         num_hidden_hyper,
@@ -254,6 +253,10 @@ class shape_model(object):
             def _hyper_network(function_embedding, reuse=True):
                 with tf.variable_scope('hyper', reuse=reuse):
                     hyper_hidden = function_embedding
+                    if config["normalize_function_embeddings"]:
+                        function_embedding -= tf.reduce_mean(function_embedding)
+                        function_embedding /= tf.sqrt(tf.reduce_mean(tf.square(function_embedding)))
+
                     for _ in range(config["num_hyper_hidden_layers"]):
                         hyper_hidden = slim.fully_connected(hyper_hidden, num_hidden_hyper,
                                                             activation_fn=internal_nonlinearity)
@@ -285,8 +288,10 @@ class shape_model(object):
                     bfinal = task_biases[:, -num_hidden_hyper:]
 
                     for i in range(num_task_hidden_layers):
-                        hidden_weights[i] = tf.squeeze(tf.nn.dropout(hidden_weights[i], self.keep_ph), axis=0)
-                        hidden_biases[i] = tf.squeeze(tf.nn.dropout(hidden_biases[i], self.keep_ph), axis=0)
+#                        hidden_weights[i] = tf.squeeze(tf.nn.dropout(hidden_weights[i], self.keep_ph), axis=0)
+#                        hidden_biases[i] = tf.squeeze(tf.nn.dropout(hidden_biases[i], self.keep_ph), axis=0)
+                        hidden_weights[i] = tf.squeeze(hidden_weights[i], axis=0)
+                        hidden_biases[i] = tf.squeeze(hidden_biases[i], axis=0)
 
                     Wfinal = tf.squeeze(Wfinal, axis=0)
                     bfinal = tf.squeeze(bfinal, axis=0)
@@ -307,6 +312,8 @@ class shape_model(object):
                         tf.matmul(task_hidden, hweights[i]) + hbiases[i])
 
                 raw_output = tf.matmul(task_hidden, hweights[-1]) + hbiases[-1]
+                if config["task_is_resnet"]:
+                    raw_output += processed_input
 
                 return raw_output
 
