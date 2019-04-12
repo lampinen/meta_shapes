@@ -24,12 +24,13 @@ config = {
     "task_is_resnet": False, # make task network a resnet
     "normalize_function_embeddings": False, # z-score function embeddings
 
-    "init_learning_rate": 3e-4,
+    "init_learning_rate": 1e-3,
     "lr_decay": 0.85,
-    "lr_decays_every": 100,
+    "lr_decays_every": 50,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 0.8, # dropout on language network
+    "train_keep_prob": 0.8, # dropout on language and hyper network
+    "train_vision_keep_prob": 0.1, # dropout on vision features 
 #    "train_batch_subset": 64, # DEACTIVATED -- how much of train batch to take at a time -- further stochasticity
     "l2_penalty_weight": 0.,
 
@@ -51,7 +52,7 @@ config = {
     "generate_vgg_features_and_exit": False, # generate and save vgg features for dataset, exit
     "load_vgg_features": True, # load vgg features instead of raw images
     "vgg_restore_path": "/mnt/fs2/lampinen/checkpoints/vgg_16/vgg_16.ckpt",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results1/"
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results5/"
 }
 
 def _save_config(filename, config):
@@ -155,6 +156,7 @@ class shape_model(object):
         self.target_ph = tf.placeholder(tf.int32, shape=[None,])
 
         self.keep_ph = tf.placeholder(tf.float32)
+        self.vision_keep_ph = tf.placeholder(tf.float32)
 
         # query processing
         with tf.variable_scope('query') as scope:
@@ -201,7 +203,7 @@ class shape_model(object):
 
                 self.vision_hidden = slim.flatten(vision_hidden)
 
-            self.vision_hidden = tf.nn.dropout(self.vision_hidden, self.keep_ph)
+            self.vision_hidden = tf.nn.dropout(self.vision_hidden, self.vision_keep_ph)
             
             self.processed_input = slim.fully_connected(self.vision_hidden, 
                                                         num_hidden_hyper,
@@ -424,6 +426,7 @@ class shape_model(object):
 
                 feed_dict = {
                     self.keep_ph: 1.,
+                    self.vision_keep_ph: 1.,
                     self.visual_input_ph: this_q_inputs
                 }
 
@@ -464,6 +467,7 @@ class shape_model(object):
 
             feed_dict = {
                 self.keep_ph: 1.,
+                self.vision_keep_ph: 1.,
                 self.query_ph: query,
                 self.visual_input_ph: this_q_inputs,
                 self.target_ph: this_q_targets
@@ -521,6 +525,7 @@ class shape_model(object):
             feed_dict = {
                 self.lr_ph: lr,
                 self.keep_ph: config["train_keep_prob"],
+                self.vision_keep_ph: config["train_vision_keep_prob"],
                 self.query_ph: query,
                 self.visual_input_ph: this_q_inputs,
                 self.target_ph: this_q_targets
