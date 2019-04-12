@@ -18,22 +18,23 @@ config = {
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
-    "num_hidden": 16,
-    "num_hidden_hyper": 256, 
+    "num_hidden": 32,
+    "num_hidden_hyper": 64, 
     "task_weight_weight_mult": 1., 
-    "task_is_resnet": True, # make task network a resnet
-    "normalize_function_embeddings": True, # z-score function embeddings
+    "task_is_resnet": False, # make task network a resnet
+    "normalize_function_embeddings": False, # z-score function embeddings
 
     "init_learning_rate": 3e-4,
     "lr_decay": 0.85,
     "lr_decays_every": 100,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 0.7, # dropout on language network
+    "train_keep_prob": 0.8, # dropout on language network
 #    "train_batch_subset": 64, # DEACTIVATED -- how much of train batch to take at a time -- further stochasticity
     "l2_penalty_weight": 0.,
 
     "train_with_meta": True, # if meta, whether to also train with meta->hyper
+    "meta_first": True, # if meta, train with only meta for first half of training
     "meta_batch_size": 32,
     "meta_embedding_scale": 1e-3, # try to match initial scale of embeddings 
                                   # from language and meta
@@ -50,7 +51,7 @@ config = {
     "generate_vgg_features_and_exit": False, # generate and save vgg features for dataset, exit
     "load_vgg_features": True, # load vgg features instead of raw images
     "vgg_restore_path": "/mnt/fs2/lampinen/checkpoints/vgg_16/vgg_16.ckpt",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results6/"
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results1/"
 }
 
 def _save_config(filename, config):
@@ -130,6 +131,7 @@ class shape_model(object):
         self.data = data
         #self.train_batch_subset = config["train_batch_subset"]
         self.train_with_meta = config["train_with_meta"]
+        self.meta_first = config["meta_first"]
         num_hidden = config["num_hidden"]
         num_hidden_hyper = config["num_hidden_hyper"]
         num_task_hidden_layers = config["num_task_hidden_layers"]
@@ -144,7 +146,7 @@ class shape_model(object):
 
         if load_vgg_features:
             self.visual_input_ph = tf.placeholder(
-                tf.float32, shape=[None, 4096]) 
+                tf.float32, shape=[None, 25088]) 
         else:
             self.visual_input_ph = tf.placeholder(
                 tf.float32, shape=[None, image_size, image_size, 3]) 
@@ -190,7 +192,8 @@ class shape_model(object):
                     _, end_points = vgg.vgg_16(vision_inputs, 
                                                is_training=False,
                                                dropout_keep_prob=self.keep_ph)
-                    vision_hidden = end_points['vision/vgg_16/fc7']
+                    vision_hidden = end_points['vision/vgg_16/pool5']
+                    #vision_hidden = end_points['vision/vgg_16/fc7']
 
 
                 variables_to_restore = tf.contrib.framework.get_variables_to_restore(include=['vision/vgg_16/'])
@@ -381,6 +384,7 @@ class shape_model(object):
         self.train_loss = self.lang_total_loss + self.l2_loss 
         if architecture_is_meta and self.train_with_meta:
             self.train_loss += self.meta_total_loss
+            self.train_meta_only_loss = self.meta_total_loss + self.l2_loss
 
 
         corr_scores = tf.reduce_sum(tf.multiply(self.lang_output_logits, self.processed_labels), axis=-1) 
@@ -392,6 +396,8 @@ class shape_model(object):
         optimizer = tf.train.RMSPropOptimizer(self.lr_ph)
 
         self.train = optimizer.minimize(self.train_loss)
+        if architecture_is_meta and self.train_with_meta:
+            self.train_meta_only = optimizer.minimize(self.train_meta_only_loss)
 
         # Saver
         self.saver = tf.train.Saver()
@@ -499,7 +505,7 @@ class shape_model(object):
         return names, results
 
 
-    def train_step(self, dataset, lr):
+    def train_step(self, dataset, lr, meta_only=False):
         inputs = dataset["input"]
         targets = dataset["output"]
         queries = dataset["query"]
@@ -522,8 +528,12 @@ class shape_model(object):
             if self.train_with_meta:
                 feed_dict[self.guess_input_mask_ph] =  self._random_guess_mask(len(this_q_targets))
 
-            self.sess.run(self.train, 
-                          feed_dict=feed_dict)
+            if meta_only:
+                op = self.train_meta_only
+            else:
+                op = self.train
+
+            self.sess.run(op, feed_dict=feed_dict)
 
 
     def do_training(self, filename):
@@ -539,8 +549,11 @@ class shape_model(object):
             lr_decay = self.config["lr_decay"]
             decay_every = self.config["lr_decays_every"]
             min_lr = self.config["min_lr"]
+            if self.meta_first: 
+                meta_epochs = self.config["num_epochs"]//2
             for epoch in range(1, self.config["num_epochs"] + 1): 
-                self.train_step(self.data["train.large"], lr)
+                self.train_step(self.data["train.large"], lr, 
+                                meta_only=self.meta_first and epoch < meta_epochs)
 
                 if epoch % eval_every == 0: 
                     _, losses = self.all_eval()
