@@ -18,18 +18,18 @@ config = {
     "num_task_hidden_layers": 3,
     "num_hyper_hidden_layers": 3,
     "num_language_layers": 2,
-    "num_hidden": 32,
-    "num_hidden_hyper": 64, 
+    "num_hidden": 64,
+    "num_hidden_hyper": 512, 
     "task_weight_weight_mult": 1., 
     "task_is_resnet": False, # make task network a resnet
     "normalize_function_embeddings": False, # z-score function embeddings
 
-    "init_learning_rate": 1e-3,
+    "init_learning_rate": 1e-4,
     "lr_decay": 0.85,
     "lr_decays_every": 50,
     "min_lr": 1e-6,
 
-    "train_keep_prob": 0.8, # dropout on language and hyper network
+    "train_keep_prob": 1., # dropout on language and hyper network
     "train_vision_keep_prob": 0.1, # dropout on vision features 
 #    "train_batch_subset": 64, # DEACTIVATED -- how much of train batch to take at a time -- further stochasticity
     "l2_penalty_weight": 0.,
@@ -52,7 +52,7 @@ config = {
     "generate_vgg_features_and_exit": False, # generate and save vgg features for dataset, exit
     "load_vgg_features": True, # load vgg features instead of raw images
     "vgg_restore_path": "/mnt/fs2/lampinen/checkpoints/vgg_16/vgg_16.ckpt",
-    "results_path": "/mnt/fs2/lampinen/meta_shapes/results5/"
+    "results_path": "/mnt/fs2/lampinen/meta_shapes/results3/"
 }
 
 def _save_config(filename, config):
